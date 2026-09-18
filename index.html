@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Rainbow Magic Hands</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      body {
+        background: #000;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        min-height: 100vh;
+      }
+      .stage {
+        position: relative;
+        width: 860px;
+        max-width: 100vw;
+      }
+      #webcam {
+        width: 100%;
+        display: block;
+        transform: scaleX(-1);
+      }
+      #fxCanvas,
+      #uiCanvas {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="stage">
+      <video id="webcam" autoplay playsinline muted></video>
+      <canvas id="fxCanvas"></canvas>
+      <canvas id="uiCanvas"></canvas>
+    </div>
+
+    <script type="module">
+      import {
+        FilesetResolver,
+        HandLandmarker,
+        FaceLandmarker,
+      } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+      const video = document.getElementById("webcam");
+      const fxCanvas = document.getElementById("fxCanvas");
+      const uiCanvas = document.getElementById("uiCanvas");
+      const fxCtx = fxCanvas.getContext("2d");
+      const uiCtx = uiCanvas.getContext("2d");
+
+      let handLandmarker = null;
+      let faceLandmarker = null;
+      let W = 0,
+        H = 0;
+
+      const RAINBOW = [
+        "#ff6b6b",
+        "#ff9f43",
+        "#ffd93d",
+        "#6bcb77",
+        "#4d96ff",
+        "#7b2fff",
+        "#c77dff",
+      ];
+      const TRAIL_LIFETIME = 2200;
+      const BAND_WIDTH = 18;
+      const handTrails = { 0: [], 1: [] };
+      const smoothTip = { 0: null, 1: null };
+      const SMOOTH = 0.55;
+      const handMissed = { 0: 0, 1: 0 };
+      const GRACE_FRAMES = 6;
+
+      const MAX_STARS = 80;
+      const stars = [];
+
+      let mouthWasOpen = false;
+      const MOUTH_THRESHOLD = 0.045;
+      const MOUTH_OUTER = [
+        61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17,
+        84, 181, 91, 146,
+      ];
+      const MOUTH_INNER = [
+        78, 191, 80, 81, 82, 13, 312, 311, 310, 415, 308, 324, 318, 402, 317,
+        14, 87, 178, 88, 95,
+      ];
+
+      const magicWords = [];
+      const MAGIC_DURATION = 2200;
+      const MAGIC_FADEIN = 180;
+      const MAGIC_FADEOUT = 600;
+
+      const CONNECTIONS = [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 4],
+        [0, 5],
+        [5, 6],
+        [6, 7],
+        [7, 8],
+        [5, 9],
+        [9, 10],
+        [10, 11],
+        [11, 12],
+        [9, 13],
+        [13, 14],
+        [14, 15],
+        [15, 16],
+        [13, 17],
+        [17, 18],
+        [18, 19],
+        [19, 20],
+        [0, 17],
+      ];
+
+      async function init() {
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm",
+        );
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numFaces: 1,
+        });
+        handLandmarker = await HandLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+            delegate: "GPU",
+          },
+          runningMode: "VIDEO",
+          numHands: 2,
+        });
+        startCamera();
+      }
+
+      async function startCamera() {
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { width: 1280, height: 720, facingMode: "user" },
+          });
+        } catch {
+          stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        }
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", () => {
+          W = video.videoWidth;
+          H = video.videoHeight;
+          fxCanvas.width = W;
+          fxCanvas.height = H;
+          uiCanvas.width = W;
+          uiCanvas.height = H;
+          requestAnimationFrame(loop);
+        });
+      }
+
+      function classifyGesture(lm) {
+        const isUp = (i) => lm[i].y < lm[i - 2].y;
+        const i = isUp(8),
+          m = isUp(12),
+          r = isUp(16),
+          p = isUp(20);
+        if (i && m && r && p) return "idle";
+        if (i && m && !r && !p) return "burst";
+        if (i && !m && !r && !p) return "draw";
+        return "idle";
+      }
+
+      function drawSkeleton(landmarks) {
+        const mx = (p) => (1 - p.x) * W;
+        const my = (p) => p.y * H;
+        uiCtx.strokeStyle = "rgba(255,255,255,0.35)";
+        uiCtx.lineWidth = 1.5;
+        CONNECTIONS.forEach(([a, b]) => {
+          uiCtx.beginPath();
+          uiCtx.moveTo(mx(landmarks[a]), my(landmarks[a]));
+          uiCtx.lineTo(mx(landmarks[b]), my(landmarks[b]));
+          uiCtx.stroke();
+        });
+        landmarks.forEach((p, i) => {
+          uiCtx.beginPath();
+          uiCtx.arc(mx(p), my(p), i === 8 ? 6 : 3, 0, Math.PI * 2);
+          uiCtx.fillStyle = i === 8 ? "#ffd93d" : "rgba(255,255,255,0.5)";
+          uiCtx.fill();
+        });
+      }
+
+      function spawnStars(x, y, count) {
+        const slots = MAX_STARS - stars.length;
+        if (slots <= 0) return;
+        for (let i = 0; i < Math.min(count, slots); i++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = 2 + Math.random() * 5;
+          stars.push({
+            x,
+            y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed - 3,
+            color: RAINBOW[Math.floor(Math.random() * RAINBOW.length)],
+            size: 3 + Math.random() * 5,
+            age: 0,
+            maxAge: 500 + Math.random() * 400,
+            rotation: Math.random() * Math.PI * 2,
+            rotSpeed: (Math.random() - 0.5) * 0.3,
+          });
+        }
+      }
+
+      function drawStar(cx, cy, r, rotation, alpha, color) {
+        fxCtx.save();
+        fxCtx.globalAlpha = alpha;
+        fxCtx.fillStyle = color;
+        fxCtx.translate(cx, cy);
+        fxCtx.rotate(rotation);
+        fxCtx.beginPath();
+        for (let i = 0; i < 5; i++) {
+          const a1 = (i * 4 * Math.PI) / 5 - Math.PI / 2;
+          const a2 = ((i * 4 + 2) * Math.PI) / 5 - Math.PI / 2;
+          if (i === 0) fxCtx.moveTo(Math.cos(a1) * r, Math.sin(a1) * r);
+          else fxCtx.lineTo(Math.cos(a1) * r, Math.sin(a1) * r);
+          fxCtx.lineTo(Math.cos(a2) * r * 0.4, Math.sin(a2) * r * 0.4);
+        }
+        fxCtx.closePath();
+        fxCtx.fill();
+        fxCtx.restore();
+      }
+
+      function drawMagicWords(now) {
+        for (let i = magicWords.length - 1; i >= 0; i--) {
+          const m = magicWords[i];
+          const age = now - m.spawnT;
+          if (age > MAGIC_DURATION) {
+            magicWords.splice(i, 1);
+            continue;
+          }
+          let alpha;
+          if (age < MAGIC_FADEIN) alpha = age / MAGIC_FADEIN;
+          else if (age > MAGIC_DURATION - MAGIC_FADEOUT)
+            alpha = (MAGIC_DURATION - age) / MAGIC_FADEOUT;
+          else alpha = 1;
+          alpha = Math.max(0, Math.min(1, alpha));
+          const popT = Math.min(1, age / (MAGIC_FADEIN * 1.5));
+          const scale =
+            popT < 0.6
+              ? (popT / 0.6) * 1.18
+              : 1.18 - ((popT - 0.6) / 0.4) * 0.18;
+          const floatY = m.y + (age / MAGIC_DURATION) * H * 0.1;
+          const fontSize = Math.round(W * 0.13);
+          fxCtx.save();
+          fxCtx.globalAlpha = alpha;
+          fxCtx.translate(m.x, floatY);
+          fxCtx.scale(scale, scale);
+          fxCtx.font = `900 ${fontSize}px Impact, Arial Black, sans-serif`;
+          fxCtx.textAlign = "center";
+          fxCtx.textBaseline = "middle";
+          fxCtx.lineWidth = fontSize * 0.14;
+          fxCtx.strokeStyle = "#000";
+          fxCtx.lineJoin = "round";
+          fxCtx.strokeText("MAGIC", 0, 0);
+          fxCtx.fillStyle = "#ffffff";
+          fxCtx.fillText("MAGIC", 0, 0);
+          fxCtx.restore();
+        }
+      }
+
+      function drawSpongeFace(fl, fx, fy, isOpen) {
+        if (!isOpen) return;
+        const eyes = [
+          { inner: 133, outer: 33, topLid: [156, 157, 158, 159, 160, 161] },
+          { inner: 362, outer: 263, topLid: [383, 384, 385, 386, 387, 388] },
+        ];
+        eyes.forEach((eye) => {
+          const innerX = fx(fl[eye.inner]),
+            innerY = fy(fl[eye.inner]);
+          const outerX = fx(fl[eye.outer]),
+            outerY = fy(fl[eye.outer]);
+          const cx = (innerX + outerX) / 2;
+          const cy = (innerY + outerY) / 2 - Math.abs(outerX - innerX) * 0.55;
+          const rx = Math.abs(outerX - innerX) * 1.2;
+          uiCtx.save();
+          uiCtx.beginPath();
+          uiCtx.arc(cx, cy, rx + rx * 0.22, 0, Math.PI * 2);
+          uiCtx.fillStyle = "#111";
+          uiCtx.shadowColor = "rgba(0,0,0,0.5)";
+          uiCtx.shadowBlur = 10;
+          uiCtx.fill();
+          uiCtx.restore();
+          uiCtx.save();
+          uiCtx.beginPath();
+          uiCtx.arc(cx, cy, rx, 0, Math.PI * 2);
+          uiCtx.fillStyle = "#fff";
+          uiCtx.fill();
+          uiCtx.restore();
+          const irisR = rx * 0.62;
+          uiCtx.save();
+          uiCtx.beginPath();
+          uiCtx.arc(cx, cy + rx * 0.06, irisR, 0, Math.PI * 2);
+          const g = uiCtx.createRadialGradient(cx, cy, 0, cx, cy, irisR);
+          g.addColorStop(0, "#a8dff7");
+          g.addColorStop(0.5, "#3aa8d8");
+          g.addColorStop(1, "#1a6a99");
+          uiCtx.fillStyle = g;
+          uiCtx.fill();
+          uiCtx.restore();
+          const pupilR = irisR * 0.48;
+          uiCtx.save();
+          uiCtx.beginPath();
+          uiCtx.arc(cx, cy + rx * 0.06, pupilR, 0, Math.PI * 2);
+          uiCtx.fillStyle = "#111";
+          uiCtx.fill();
+          uiCtx.restore();
+          uiCtx.save();
+          uiCtx.beginPath();
+          uiCtx.arc(
+            cx - pupilR * 0.4,
+            cy - pupilR * 0.3 + rx * 0.06,
+            pupilR * 0.3,
+            0,
+            Math.PI * 2,
+          );
+          uiCtx.fillStyle = "rgba(255,255,255,0.95)";
+          uiCtx.fill();
+          uiCtx.restore();
+          for (let li = 0; li < 8; li++) {
+            const angle = Math.PI + Math.PI * 0.1 + (li / 7) * (Math.PI * 0.8);
+            const baseR = rx + rx * 0.22;
+            const bx = cx + Math.cos(angle) * baseR;
+            const by = cy + Math.sin(angle) * baseR;
+            const nx = Math.cos(angle),
+              ny = Math.sin(angle);
+            const lf = 0.55 + 0.75 * Math.sin((li / 7) * Math.PI);
+            const tipX = bx + nx * rx * 0.55 * lf,
+              tipY = by + ny * rx * 0.55 * lf;
+            const cp = (li % 2 === 0 ? -1 : 1) * rx * 0.12;
+            uiCtx.save();
+            uiCtx.beginPath();
+            uiCtx.moveTo(bx, by);
+            uiCtx.quadraticCurveTo(
+              bx + nx * rx * 0.55 * lf * 0.5 + -ny * cp,
+              by + ny * rx * 0.55 * lf * 0.5 + nx * cp,
+              tipX,
+              tipY,
+            );
+            uiCtx.strokeStyle = "#111";
+            uiCtx.lineWidth = rx * 0.13;
+            uiCtx.lineCap = "round";
+            uiCtx.stroke();
+            uiCtx.restore();
+          }
+        });
+        const lipTopX = fx(fl[0]),
+          lipTopY = fy(fl[0]);
+        const mouthW = Math.abs(fx(fl[291]) - fx(fl[61]));
+        const baseW = mouthW * 1.04,
+          baseH = mouthW * 1.12,
+          gap = mouthW * 0.05;
+        [
+          [lipTopX - gap / 2 - baseW * 1.18, baseW * 1.18, baseH * 1.14],
+          [lipTopX + gap / 2, baseW, baseH],
+        ].forEach(([tx, tW, tH]) => {
+          const r = tW * 0.12;
+          uiCtx.save();
+          uiCtx.shadowColor = "rgba(0,0,0,0.35)";
+          uiCtx.shadowBlur = 14;
+          uiCtx.beginPath();
+          uiCtx.moveTo(tx + r, lipTopY);
+          uiCtx.lineTo(tx + tW - r, lipTopY);
+          uiCtx.quadraticCurveTo(tx + tW, lipTopY, tx + tW, lipTopY + r);
+          uiCtx.lineTo(tx + tW, lipTopY + tH);
+          uiCtx.lineTo(tx, lipTopY + tH);
+          uiCtx.lineTo(tx, lipTopY + r);
+          uiCtx.quadraticCurveTo(tx, lipTopY, tx + r, lipTopY);
+          uiCtx.closePath();
+          const tg = uiCtx.createLinearGradient(tx, lipTopY, tx, lipTopY + tH);
+          tg.addColorStop(0, "#fffff5");
+          tg.addColorStop(0.6, "#f5eedc");
+          tg.addColorStop(1, "#e0d8c0");
+          uiCtx.fillStyle = tg;
+          uiCtx.fill();
+          uiCtx.strokeStyle = "#aaa";
+          uiCtx.lineWidth = tW * 0.04;
+          uiCtx.lineJoin = "round";
+          uiCtx.stroke();
+          uiCtx.restore();
+        });
+      }
+
+      function loop(timestamp) {
+        const now = performance.now();
+        uiCtx.clearRect(0, 0, W, H);
+        fxCtx.clearRect(0, 0, W, H);
+
+        const results = handLandmarker.detectForVideo(video, timestamp);
+        const activeCount = results.landmarks.length;
+        [0, 1].forEach((hi) => {
+          if (activeCount <= hi) {
+            handMissed[hi]++;
+            if (handMissed[hi] > GRACE_FRAMES) {
+              handTrails[hi] = [];
+              smoothTip[hi] = null;
+            }
+          } else {
+            handMissed[hi] = 0;
+          }
+        });
+
+        results.landmarks.forEach((landmarks, handIndex) => {
+          drawSkeleton(landmarks);
+          const gesture = classifyGesture(landmarks);
+          const rawX = (1 - landmarks[8].x) * W;
+          const rawY = landmarks[8].y * H;
+          if (!smoothTip[handIndex])
+            smoothTip[handIndex] = { x: rawX, y: rawY };
+          smoothTip[handIndex].x =
+            smoothTip[handIndex].x * SMOOTH + rawX * (1 - SMOOTH);
+          smoothTip[handIndex].y =
+            smoothTip[handIndex].y * SMOOTH + rawY * (1 - SMOOTH);
+          const tipX = smoothTip[handIndex].x;
+          const tipY = smoothTip[handIndex].y;
+
+          if (gesture === "draw") {
+            const trail = handTrails[handIndex];
+            const last = trail[trail.length - 1];
+            const dist = last ? Math.hypot(tipX - last.x, tipY - last.y) : 0;
+            if (!last || dist > 180)
+              handTrails[handIndex] = [{ x: tipX, y: tipY, t: now }];
+            else if (dist >= 2) trail.push({ x: tipX, y: tipY, t: now });
+          } else if (gesture === "burst") {
+            spawnStars(tipX, tipY, 12);
+            handTrails[handIndex] = [];
+          }
+        });
+
+        if (faceLandmarker) {
+          const faceResults = faceLandmarker.detectForVideo(video, timestamp);
+          if (faceResults.faceLandmarks.length > 0) {
+            const fl = faceResults.faceLandmarks[0];
+            const fx = (p) => (1 - p.x) * W;
+            const fy = (p) => p.y * H;
+            const upperLip = fl[13],
+              lowerLip = fl[14];
+            const noseTip = fl[1],
+              chin = fl[152];
+            const faceH = Math.abs(chin.y - noseTip.y);
+            const isOpen = (lowerLip.y - upperLip.y) / faceH > MOUTH_THRESHOLD;
+            if (isOpen && !mouthWasOpen)
+              magicWords.push({
+                x: W / 2,
+                y: fy(chin) + H * 0.04,
+                spawnT: now,
+              });
+            mouthWasOpen = isOpen;
+            const dotColor = isOpen ? "#ffd93d" : "rgba(255,255,255,0.5)";
+            [...MOUTH_OUTER, ...MOUTH_INNER].forEach((idx) => {
+              const p = fl[idx];
+              uiCtx.beginPath();
+              uiCtx.arc(fx(p), fy(p), isOpen ? 3.5 : 2.5, 0, Math.PI * 2);
+              uiCtx.fillStyle = dotColor;
+              uiCtx.fill();
+            });
+            drawSpongeFace(fl, fx, fy, isOpen);
+          } else {
+            mouthWasOpen = false;
+          }
+        }
+
+        const cutoff = now - TRAIL_LIFETIME;
+        [0, 1].forEach((hi) => {
+          while (handTrails[hi].length && handTrails[hi][0].t < cutoff)
+            handTrails[hi].shift();
+        });
+
+        [0, 1].forEach((hi) => {
+          const pts = handTrails[hi];
+          if (pts.length < 2) return;
+          const normals = pts.map((p, i) => {
+            const prev = pts[Math.max(0, i - 1)];
+            const next = pts[Math.min(pts.length - 1, i + 1)];
+            const dx = next.x - prev.x,
+              dy = next.y - prev.y;
+            const len = Math.sqrt(dx * dx + dy * dy) || 1;
+            return { nx: -dy / len, ny: dx / len };
+          });
+          RAINBOW.forEach((color, bi) => {
+            const offset = (bi - (RAINBOW.length - 1) / 2) * (BAND_WIDTH * 0.9);
+            const bpts = pts.map((p, i) => ({
+              x: p.x + normals[i].nx * offset,
+              y: p.y + normals[i].ny * offset,
+            }));
+            fxCtx.save();
+            fxCtx.strokeStyle = color;
+            fxCtx.lineWidth = BAND_WIDTH * 0.95;
+            fxCtx.lineCap = "round";
+            fxCtx.lineJoin = "round";
+            fxCtx.shadowColor = color;
+            fxCtx.shadowBlur = 8;
+            for (let i = 1; i < bpts.length; i++) {
+              const alpha =
+                Math.max(0, 1 - (now - pts[i].t) / TRAIL_LIFETIME) * 0.88;
+              if (alpha <= 0) continue;
+              const p0 = bpts[Math.max(0, i - 2)],
+                p1 = bpts[i - 1];
+              const p2 = bpts[i],
+                p3 = bpts[Math.min(bpts.length - 1, i + 1)];
+              const t = 0.5;
+              fxCtx.globalAlpha = alpha;
+              fxCtx.beginPath();
+              fxCtx.moveTo(p1.x, p1.y);
+              fxCtx.bezierCurveTo(
+                p1.x + ((p2.x - p0.x) * t) / 3,
+                p1.y + ((p2.y - p0.y) * t) / 3,
+                p2.x - ((p3.x - p1.x) * t) / 3,
+                p2.y - ((p3.y - p1.y) * t) / 3,
+                p2.x,
+                p2.y,
+              );
+              fxCtx.stroke();
+            }
+            fxCtx.restore();
+          });
+        });
+
+        for (let i = stars.length - 1; i >= 0; i--) {
+          const s = stars[i];
+          s.age += 16;
+          if (s.age > s.maxAge) {
+            stars.splice(i, 1);
+            continue;
+          }
+          s.vy += 0.18;
+          s.x += s.vx;
+          s.y += s.vy;
+          s.vx *= 0.99;
+          s.rotation += s.rotSpeed;
+          drawStar(s.x, s.y, s.size, s.rotation, 1 - s.age / s.maxAge, s.color);
+        }
+
+        drawMagicWords(now);
+        requestAnimationFrame(loop);
+      }
+
+      init();
+    </script>
+  </body>
+</html>
